@@ -19,6 +19,14 @@ from uuid import uuid4
 
 # 导入核心翻译功能
 from translate_vtt_zh_deepl_native import (
+    DEEPSEEK_CHAT_COMPLETIONS_ENDPOINT,
+    DEEPSEEK_DEFAULT_MODEL,
+    GEMINI_BASE_URL,
+    GEMINI_DEFAULT_MODEL,
+    OPENAI_DEFAULT_MODEL,
+    OPENAI_RESPONSES_ENDPOINT,
+    normalize_gemini_endpoint,
+    normalize_openai_compatible_endpoint,
     read_text,
     should_translate,
 )
@@ -36,12 +44,42 @@ ALLOWED_ENDPOINTS = {
     "https://api-free.deepl.com/v2/translate",
     "https://api.deepl.com/v2/translate",
 }
+ALLOWED_OPENAI_ENDPOINTS = {OPENAI_RESPONSES_ENDPOINT}
+ALLOWED_DEEPSEEK_ENDPOINT_PREFIX = "https://api.deepseek.com"
+ALLOWED_GEMINI_ENDPOINT_PREFIX = "https://generativelanguage.googleapis.com"
 ALLOWED_TARGET_LANGS = {"ZH", "EN", "JA", "KO", "FR", "DE", "ES", "IT", "PT", "RU"}
+ALLOWED_OPENAI_MODELS = {"gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.4", "gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"}
+ALLOWED_DEEPSEEK_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
+ALLOWED_GEMINI_MODELS = {"gemini-3.1-flash-lite-preview", "gemini-2.5-flash-lite", "gemini-2.5-flash"}
 
 TRANSLATOR_PROFILES = {
     "deepl": {
         "default_chunk_size": 160,
+        "default_concurrency": 2,
         "default_max_retries": 2,
+        "default_endpoint": "https://api-free.deepl.com/v2/translate",
+        "default_model": "",
+    },
+    "openai": {
+        "default_chunk_size": 5,
+        "default_concurrency": 12,
+        "default_max_retries": 2,
+        "default_endpoint": OPENAI_RESPONSES_ENDPOINT,
+        "default_model": "gpt-5.4-nano",
+    },
+    "deepseek": {
+        "default_chunk_size": 5,
+        "default_concurrency": 12,
+        "default_max_retries": 2,
+        "default_endpoint": DEEPSEEK_CHAT_COMPLETIONS_ENDPOINT,
+        "default_model": DEEPSEEK_DEFAULT_MODEL,
+    },
+    "gemini": {
+        "default_chunk_size": 5,
+        "default_concurrency": 12,
+        "default_max_retries": 1,
+        "default_endpoint": GEMINI_BASE_URL,
+        "default_model": "gemini-2.5-flash-lite",
     }
 }
 
@@ -178,8 +216,26 @@ def cleanup_old_jobs(force: bool = False) -> None:
         safe_unlink(output_file)
 
 
-def translate_worker(job_id, input_file, output_file, api_key, endpoint, target_lang,
-                    bilingual, chunk_size, max_retries):
+def translate_worker(
+    job_id,
+    input_file,
+    output_file,
+    provider,
+    api_key,
+    endpoint,
+    target_lang,
+    model,
+    bilingual,
+    chunk_size,
+    concurrency,
+    max_retries,
+    max_chars,
+    max_paragraphs,
+    rps,
+    request_timeout,
+    fallback_mode,
+    repair_concurrency,
+):
     """翻译工作线程"""
     try:
         update_job(
@@ -194,7 +250,7 @@ def translate_worker(job_id, input_file, output_file, api_key, endpoint, target_
             log_messages=[],
             failed_batches=0,
         )
-        log_message(job_id, "开始翻译任务")
+        log_message(job_id, f"开始翻译任务 provider={provider}")
 
         # 读取文件
         log_message(job_id, f"读取文件: {input_file}")
@@ -215,12 +271,21 @@ def translate_worker(job_id, input_file, output_file, api_key, endpoint, target_
         translated_lines = translate_with_progress(
             job_id,
             lines,
+            provider,
             api_key,
             endpoint,
             target_lang,
+            model,
             bilingual,
             chunk_size,
+            concurrency,
             max_retries,
+            max_chars,
+            max_paragraphs,
+            rps,
+            request_timeout,
+            fallback_mode,
+            repair_concurrency,
         )
 
         if not should_continue(job_id):
@@ -259,8 +324,25 @@ def translate_worker(job_id, input_file, output_file, api_key, endpoint, target_
         update_job(job_id, is_running=False)
 
 
-def translate_with_progress(job_id, lines, api_key, endpoint, target_lang,
-                          bilingual, chunk_size, max_retries):
+def translate_with_progress(
+    job_id,
+    lines,
+    provider,
+    api_key,
+    endpoint,
+    target_lang,
+    model,
+    bilingual,
+    chunk_size,
+    concurrency,
+    max_retries,
+    max_chars,
+    max_paragraphs,
+    rps,
+    request_timeout,
+    fallback_mode,
+    repair_concurrency,
+):
     """带进度显示的翻译函数，底层复用核心并发逻辑"""
     from translate_vtt_zh_deepl_native import should_translate, translate_lines_native
 
@@ -282,16 +364,25 @@ def translate_with_progress(job_id, lines, api_key, endpoint, target_lang,
     return translate_lines_native(
         lines,
         api_key=api_key,
+        provider=provider,
         endpoint=endpoint,
         target_lang=target_lang,
+        model=model,
         bilingual=bilingual,
         every=max(1, min(10, chunk_size)),
         chunk=max(1, chunk_size),
+        concurrency=max(1, concurrency),
         max_retries=max_retries,
+        max_chars=max_chars,
+        max_paragraphs=max_paragraphs,
+        rps=rps,
         progress_callback=progress_callback if total > 0 else None,
         stop_check=lambda: should_continue(job_id),
         batch_error_callback=batch_error_callback,
         log_progress=False,
+        request_timeout=request_timeout,
+        fallback_mode=fallback_mode,
+        repair_concurrency=repair_concurrency,
     )
 
 @app.route('/')
@@ -436,7 +527,17 @@ def index():
                 </div>
                 
                 <div class="form-group">
-                    <label for="apiKey">DeepL API密钥:</label>
+                    <label for="provider">翻译服务:</label>
+                    <select id="provider" name="provider">
+                        <option value="openai">OpenAI</option>
+                        <option value="deepl">DeepL</option>
+                        <option value="deepseek">DeepSeek</option>
+                        <option value="gemini">Gemini</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label for="apiKey" id="apiKeyLabel">DeepL API密钥:</label>
                     <input type="password" id="apiKey" name="apiKey" placeholder="输入您的DeepL API密钥" required>
                 </div>
                 
@@ -445,6 +546,23 @@ def index():
                     <select id="endpoint" name="endpoint">
                         <option value="https://api-free.deepl.com/v2/translate">免费版 (api-free.deepl.com)</option>
                         <option value="https://api.deepl.com/v2/translate">专业版 (api.deepl.com)</option>
+                    </select>
+                </div>
+
+                <div class="form-group" id="modelGroup">
+                    <label for="model">模型:</label>
+                    <select id="model" name="model">
+                        <option value="gpt-5.4-nano">gpt-5.4-nano</option>
+                        <option value="gpt-5.4-mini">gpt-5.4-mini</option>
+                        <option value="gpt-5.4">gpt-5.4</option>
+                        <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+                        <option value="gpt-4.1">gpt-4.1</option>
+                        <option value="gpt-4o-mini">gpt-4o-mini</option>
+                        <option value="deepseek-v4-flash">deepseek-v4-flash</option>
+                        <option value="deepseek-v4-pro">deepseek-v4-pro</option>
+                        <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
+                        <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                        <option value="gemini-3.1-flash-lite-preview">gemini-3.1-flash-lite-preview</option>
                     </select>
                 </div>
                 
@@ -472,8 +590,30 @@ def index():
                 </div>
                 
                 <div class="form-group">
-                    <label>批处理大小: <input type="number" id="chunkSize" name="chunkSize" value="160" min="1" max="1000" class="number-input"></label>
+                    <label>chunk(兜底): <input type="number" id="chunkSize" name="chunkSize" value="5" min="1" max="1000" class="number-input"></label>
+                    <label style="margin-left: 20px;">并发数: <input type="number" id="concurrency" name="concurrency" value="12" min="1" max="20" class="number-input"></label>
                     <label style="margin-left: 20px;">最大重试次数: <input type="number" id="maxRetries" name="maxRetries" value="2" min="0" max="10" class="number-input"></label>
+                </div>
+
+                <div class="form-group">
+                    <label>自适应分批: max_chars <input type="number" id="maxChars" name="maxChars" value="1800" min="0" max="20000" class="number-input"></label>
+                    <label style="margin-left: 20px;">max_paragraphs <input type="number" id="maxParagraphs" name="maxParagraphs" value="12" min="0" max="200" class="number-input"></label>
+                    <label style="margin-left: 20px;">RPS <input type="number" id="rps" name="rps" value="0" min="0" max="100" step="0.1" class="number-input"></label>
+                </div>
+                <div class="form-group">
+                    <small style="color:#666;">说明：当 max_chars 或 max_paragraphs 大于 0 时，chunk 仅作为兜底值，不是主分批策略。</small>
+                </div>
+
+                <div class="form-group">
+                    <label>超时(s) <input type="number" id="requestTimeout" name="requestTimeout" value="90" min="1" max="300" class="number-input"></label>
+                    <label style="margin-left: 20px;">fallback模式
+                        <select id="fallbackMode" name="fallbackMode" class="number-input" style="width: 150px;">
+                            <option value="immediate">immediate</option>
+                            <option value="deferred">deferred</option>
+                            <option value="deferred-fastpath">deferred-fastpath</option>
+                        </select>
+                    </label>
+                    <label style="margin-left: 20px;">repair并发 <input type="number" id="repairConcurrency" name="repairConcurrency" value="1" min="1" max="20" class="number-input"></label>
                 </div>
                 
                 <div class="form-group">
@@ -497,11 +637,120 @@ def index():
         <script>
             let isTranslating = false;
             let currentJobId = null;
+            const providerDefaults = {
+                deepl: {
+                    apiKeyLabel: 'DeepL API密钥:',
+                    apiKeyPlaceholder: '输入您的DeepL API密钥',
+                    endpoints: [
+                        { value: 'https://api-free.deepl.com/v2/translate', label: '免费版 (api-free.deepl.com)' },
+                        { value: 'https://api.deepl.com/v2/translate', label: '专业版 (api.deepl.com)' }
+                    ],
+                    endpoint: 'https://api-free.deepl.com/v2/translate',
+                    chunkSize: 160,
+                    concurrency: 2,
+                    maxRetries: 2,
+                    maxChars: 0,
+                    maxParagraphs: 0,
+                    modelDisabled: true,
+                    model: '',
+                    models: [],
+                },
+                openai: {
+                    apiKeyLabel: 'OpenAI API密钥:',
+                    apiKeyPlaceholder: '输入您的OpenAI API密钥',
+                    endpoints: [
+                        { value: 'https://api.openai.com/v1/responses', label: 'Responses API (api.openai.com/v1/responses)' }
+                    ],
+                    endpoint: 'https://api.openai.com/v1/responses',
+                    chunkSize: 5,
+                    concurrency: 12,
+                    maxRetries: 2,
+                    maxChars: 1800,
+                    maxParagraphs: 12,
+                    modelDisabled: false,
+                    model: 'gpt-5.4-nano',
+                    models: ['gpt-5.4-nano', 'gpt-5.4-mini', 'gpt-5.4', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o-mini'],
+                },
+                deepseek: {
+                    apiKeyLabel: 'DeepSeek API密钥:',
+                    apiKeyPlaceholder: '输入您的DeepSeek API密钥',
+                    endpoints: [
+                        { value: 'https://api.deepseek.com/chat/completions', label: 'DeepSeek Chat Completions (官方)' }
+                    ],
+                    endpoint: 'https://api.deepseek.com/chat/completions',
+                    chunkSize: 5,
+                    concurrency: 12,
+                    maxRetries: 2,
+                    maxChars: 1800,
+                    maxParagraphs: 12,
+                    modelDisabled: false,
+                    model: 'deepseek-v4-flash',
+                    models: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+                },
+                gemini: {
+                    apiKeyLabel: 'Gemini API密钥:',
+                    apiKeyPlaceholder: '输入您的Gemini API密钥',
+                    endpoints: [
+                        { value: 'https://generativelanguage.googleapis.com/v1beta', label: 'Generative Language API (v1beta)' }
+                    ],
+                    endpoint: 'https://generativelanguage.googleapis.com/v1beta',
+                    chunkSize: 5,
+                    concurrency: 12,
+                    maxRetries: 1,
+                    maxChars: 1800,
+                    maxParagraphs: 12,
+                    modelDisabled: false,
+                    model: 'gemini-2.5-flash-lite',
+                    models: ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-3.1-flash-lite-preview'],
+                },
+            };
             
             document.getElementById('translateForm').addEventListener('submit', function(e) {
                 e.preventDefault();
                 startTranslation();
             });
+            document.getElementById('provider').addEventListener('change', function() {
+                applyProviderDefaults(this.value);
+            });
+            applyProviderDefaults('openai');
+
+            function applyProviderDefaults(provider) {
+                const p = providerDefaults[provider] || providerDefaults.deepl;
+                const endpoint = document.getElementById('endpoint');
+                const model = document.getElementById('model');
+                const modelGroup = document.getElementById('modelGroup');
+                const apiKeyLabel = document.getElementById('apiKeyLabel');
+                const apiKey = document.getElementById('apiKey');
+                endpoint.innerHTML = '';
+                p.endpoints.forEach(item => {
+                    const option = document.createElement('option');
+                    option.value = item.value;
+                    option.textContent = item.label;
+                    endpoint.appendChild(option);
+                });
+                endpoint.value = p.endpoint;
+                document.getElementById('chunkSize').value = p.chunkSize;
+                document.getElementById('concurrency').value = p.concurrency;
+                document.getElementById('maxRetries').value = p.maxRetries;
+                if (typeof p.maxChars !== 'undefined') {
+                    document.getElementById('maxChars').value = p.maxChars;
+                }
+                if (typeof p.maxParagraphs !== 'undefined') {
+                    document.getElementById('maxParagraphs').value = p.maxParagraphs;
+                }
+                model.innerHTML = '';
+                (p.models || []).forEach(m => {
+                    const option = document.createElement('option');
+                    option.value = m;
+                    option.textContent = m;
+                    model.appendChild(option);
+                });
+                model.value = p.model || '';
+                model.disabled = p.modelDisabled;
+                modelGroup.style.display = p.modelDisabled ? 'none' : 'block';
+                apiKeyLabel.textContent = p.apiKeyLabel;
+                apiKey.placeholder = p.apiKeyPlaceholder || '';
+            }
             
             function startTranslation() {
                 if (isTranslating) return;
@@ -514,13 +763,21 @@ def index():
                 }
                 
                 formData.append('inputFile', inputFile);
-                formData.append('provider', 'deepl');
+                formData.append('provider', document.getElementById('provider').value);
                 formData.append('apiKey', document.getElementById('apiKey').value);
                 formData.append('endpoint', document.getElementById('endpoint').value);
                 formData.append('targetLang', document.getElementById('targetLang').value);
+                formData.append('model', document.getElementById('model').value);
                 formData.append('bilingual', document.getElementById('bilingual').checked);
                 formData.append('chunkSize', document.getElementById('chunkSize').value);
+                formData.append('concurrency', document.getElementById('concurrency').value);
                 formData.append('maxRetries', document.getElementById('maxRetries').value);
+                formData.append('maxChars', document.getElementById('maxChars').value);
+                formData.append('maxParagraphs', document.getElementById('maxParagraphs').value);
+                formData.append('rps', document.getElementById('rps').value);
+                formData.append('requestTimeout', document.getElementById('requestTimeout').value);
+                formData.append('fallbackMode', document.getElementById('fallbackMode').value);
+                formData.append('repairConcurrency', document.getElementById('repairConcurrency').value);
                 
                 isTranslating = true;
                 document.getElementById('translateBtn').disabled = true;
@@ -678,39 +935,83 @@ def translate():
         output_path = os.path.join(app.config['UPLOAD_FOLDER'], output_filename)
         
         # 获取参数
-        provider = (request.form.get('provider') or 'deepl').strip().lower()
+        provider = (request.form.get('provider') or 'openai').strip().lower()
+        if provider not in {"openai", "deepl", "deepseek", "gemini"}:
+            return jsonify({'success': False, 'error': '当前Web端仅开放 OpenAI / DeepL / DeepSeek / Gemini'})
         profile = get_translator_profile(provider)
         if not profile:
             return jsonify({'success': False, 'error': '不支持的 provider'})
 
         api_key = (request.form.get('apiKey') or '').strip()
-        endpoint = (request.form.get('endpoint') or '').strip()
+        endpoint = (request.form.get('endpoint') or profile["default_endpoint"]).strip()
         target_lang = (request.form.get('targetLang') or '').strip().upper()
+        model = (request.form.get('model') or profile["default_model"]).strip()
         bilingual = request.form.get('bilingual') == 'true'
         try:
             chunk_size = int(request.form.get('chunkSize', profile["default_chunk_size"]))
+            concurrency = int(request.form.get('concurrency', profile["default_concurrency"]))
             max_retries = int(request.form.get('maxRetries', profile["default_max_retries"]))
+            max_chars = int(request.form.get('maxChars', 0))
+            max_paragraphs = int(request.form.get('maxParagraphs', 0))
+            repair_concurrency = int(request.form.get('repairConcurrency', 1))
         except ValueError:
-            return jsonify({'success': False, 'error': '参数格式错误：chunkSize/maxRetries 必须是数字'})
+            return jsonify({'success': False, 'error': '参数格式错误：数值参数必须是数字'})
+
+        try:
+            rps = float(request.form.get('rps', 0))
+            request_timeout = float(request.form.get('requestTimeout', 90))
+        except ValueError:
+            return jsonify({'success': False, 'error': '参数格式错误：rps/requestTimeout 必须是数字'})
+
+        fallback_mode = (request.form.get('fallbackMode') or 'immediate').strip().lower()
 
         # 后端强制限幅，避免前端限制被绕过导致超大请求
         chunk_size = max(1, min(MAX_CHUNK_SIZE, chunk_size))
+        concurrency = max(1, min(20, concurrency))
         max_retries = max(0, min(10, max_retries))
+        max_chars = max(0, min(20000, max_chars))
+        max_paragraphs = max(0, min(500, max_paragraphs))
+        rps = max(0.0, min(100.0, rps))
+        request_timeout = max(1.0, min(300.0, request_timeout))
+        repair_concurrency = max(1, min(20, repair_concurrency))
+        if fallback_mode not in {"immediate", "deferred", "deferred-fastpath"}:
+            return jsonify({'success': False, 'error': '非法 fallbackMode'})
 
         if not api_key:
             return jsonify({'success': False, 'error': 'API Key 不能为空'})
-        if endpoint not in ALLOWED_ENDPOINTS:
-            return jsonify({'success': False, 'error': '非法 endpoint'})
         if target_lang not in ALLOWED_TARGET_LANGS:
             return jsonify({'success': False, 'error': '非法 targetLang'})
+        if provider == "deepl":
+            if endpoint not in ALLOWED_ENDPOINTS:
+                return jsonify({'success': False, 'error': '非法 endpoint'})
+        elif provider == "openai":
+            if endpoint not in ALLOWED_OPENAI_ENDPOINTS:
+                return jsonify({'success': False, 'error': '非法 endpoint'})
+            if model not in ALLOWED_OPENAI_MODELS:
+                return jsonify({'success': False, 'error': '非法 model'})
+        elif provider == "deepseek":
+            if not endpoint.startswith(ALLOWED_DEEPSEEK_ENDPOINT_PREFIX):
+                return jsonify({'success': False, 'error': '非法 endpoint'})
+            endpoint = normalize_openai_compatible_endpoint(endpoint, provider)
+            if model not in ALLOWED_DEEPSEEK_MODELS:
+                return jsonify({'success': False, 'error': '非法 model'})
+        elif provider == "gemini":
+            if not endpoint.startswith(ALLOWED_GEMINI_ENDPOINT_PREFIX):
+                return jsonify({'success': False, 'error': '非法 endpoint'})
+            if model not in ALLOWED_GEMINI_MODELS:
+                return jsonify({'success': False, 'error': '非法 model'})
+            endpoint = normalize_gemini_endpoint(endpoint, model)
+        else:
+            return jsonify({'success': False, 'error': '不支持的 provider'})
 
         create_job(job_id, input_path, output_path, filename)
 
         # 启动翻译线程
         thread = threading.Thread(
             target=translate_worker,
-            args=(job_id, input_path, output_path, api_key, endpoint, target_lang,
-                  bilingual, chunk_size, max_retries),
+            args=(job_id, input_path, output_path, provider, api_key, endpoint, target_lang,
+                  model, bilingual, chunk_size, concurrency, max_retries,
+                  max_chars, max_paragraphs, rps, request_timeout, fallback_mode, repair_concurrency),
             daemon=True
         )
         thread.start()
