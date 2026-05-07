@@ -26,22 +26,29 @@ DEEPL_DEFAULT_CONCURRENCY = 1
 DEEPL_DEFAULT_MAX_RETRIES = 2
 
 OPENAI_DEFAULT_CHUNK_SIZE = 5
-OPENAI_DEFAULT_CONCURRENCY = 10
-OPENAI_DEFAULT_MAX_RETRIES = 2
-OPENAI_DEFAULT_MODEL = "gpt-4.1-mini"
+OPENAI_DEFAULT_CONCURRENCY = 96
+OPENAI_DEFAULT_MAX_RETRIES = 1
+OPENAI_DEFAULT_MAX_CHARS = 1200
+OPENAI_DEFAULT_MAX_PARAGRAPHS = 6
+OPENAI_DEFAULT_MODEL = "gpt-5-nano"
 OPENAI_RESPONSES_ENDPOINT = "https://api.openai.com/v1/responses"
+OPENAI_REASONING_EFFORT_CHOICES = {"none", "minimal", "low", "medium", "high", "xhigh"}
 
 DEEPSEEK_DEFAULT_CHUNK_SIZE = 5
-DEEPSEEK_DEFAULT_CONCURRENCY = 10
-DEEPSEEK_DEFAULT_MAX_RETRIES = 2
+DEEPSEEK_DEFAULT_CONCURRENCY = 96
+DEEPSEEK_DEFAULT_MAX_RETRIES = 1
+DEEPSEEK_DEFAULT_MAX_CHARS = 1200
+DEEPSEEK_DEFAULT_MAX_PARAGRAPHS = 6
 DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_CHAT_COMPLETIONS_ENDPOINT = f"{DEEPSEEK_BASE_URL}/chat/completions"
 
 GEMINI_DEFAULT_CHUNK_SIZE = 5
-GEMINI_DEFAULT_CONCURRENCY = 8
+GEMINI_DEFAULT_CONCURRENCY = 96
 GEMINI_DEFAULT_MAX_RETRIES = 1
-GEMINI_DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
+GEMINI_DEFAULT_MAX_CHARS = 1200
+GEMINI_DEFAULT_MAX_PARAGRAPHS = 6
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash-lite"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 AI_LINE_SEPARATOR = "\n<<<VTT_TRANSLATOR_LINE_BREAK_8F3B>>>\n"
@@ -140,6 +147,8 @@ def provider_defaults(provider: str) -> dict[str, int | str]:
         return {
             "chunk": OPENAI_DEFAULT_CHUNK_SIZE,
             "concurrency": OPENAI_DEFAULT_CONCURRENCY,
+            "max_chars": OPENAI_DEFAULT_MAX_CHARS,
+            "max_paragraphs": OPENAI_DEFAULT_MAX_PARAGRAPHS,
             "max_retries": OPENAI_DEFAULT_MAX_RETRIES,
             "endpoint": OPENAI_RESPONSES_ENDPOINT,
             "model": OPENAI_DEFAULT_MODEL,
@@ -148,6 +157,8 @@ def provider_defaults(provider: str) -> dict[str, int | str]:
         return {
             "chunk": DEEPSEEK_DEFAULT_CHUNK_SIZE,
             "concurrency": DEEPSEEK_DEFAULT_CONCURRENCY,
+            "max_chars": DEEPSEEK_DEFAULT_MAX_CHARS,
+            "max_paragraphs": DEEPSEEK_DEFAULT_MAX_PARAGRAPHS,
             "max_retries": DEEPSEEK_DEFAULT_MAX_RETRIES,
             "endpoint": DEEPSEEK_CHAT_COMPLETIONS_ENDPOINT,
             "model": DEEPSEEK_DEFAULT_MODEL,
@@ -156,6 +167,8 @@ def provider_defaults(provider: str) -> dict[str, int | str]:
         return {
             "chunk": GEMINI_DEFAULT_CHUNK_SIZE,
             "concurrency": GEMINI_DEFAULT_CONCURRENCY,
+            "max_chars": GEMINI_DEFAULT_MAX_CHARS,
+            "max_paragraphs": GEMINI_DEFAULT_MAX_PARAGRAPHS,
             "max_retries": GEMINI_DEFAULT_MAX_RETRIES,
             "endpoint": GEMINI_BASE_URL,
             "model": GEMINI_DEFAULT_MODEL,
@@ -364,6 +377,22 @@ def _openai_call_responses(
             time.sleep(base_delay * attempt)
 
 
+def _resolve_openai_reasoning_effort(model: str, requested_effort: str) -> str:
+    model_lower = (model or "").strip().lower()
+    effort = (requested_effort or "low").strip().lower()
+    if effort not in OPENAI_REASONING_EFFORT_CHOICES:
+        effort = "low"
+
+    # gpt-5.4 family supports none/low/medium/high/xhigh.
+    if model_lower.startswith("gpt-5.4"):
+        return effort if effort in {"none", "low", "medium", "high", "xhigh"} else "low"
+    # gpt-5-nano family supports minimal/low/medium/high.
+    if model_lower.startswith("gpt-5"):
+        return effort if effort in {"minimal", "low", "medium", "high"} else "low"
+    # non GPT-5 models in this tool use low as the only exposed option.
+    return "low"
+
+
 def _openai_call_chat_completions(
     payload: dict,
     api_key: str,
@@ -440,6 +469,7 @@ def openai_translate_batch(
     base_delay: float = 1.0,
     strict_json_fallback: bool = True,
     request_timeout: float = 90.0,
+    openai_reasoning_effort: str = "low",
 ) -> List[str]:
     def call(system_text: str, user_text: str) -> str:
         payload = {
@@ -455,6 +485,9 @@ def openai_translate_batch(
                 },
             ],
         }
+        resolved_reasoning_effort = _resolve_openai_reasoning_effort(model, openai_reasoning_effort)
+        if resolved_reasoning_effort:
+            payload["reasoning"] = {"effort": resolved_reasoning_effort}
         return _openai_call_responses(
             payload=payload,
             api_key=api_key,
@@ -595,6 +628,7 @@ def translate_lines_native(
     slow_split_threshold: float = 0.0,
     repair_concurrency: int = 1,
     no_thinking: bool = True,
+    openai_reasoning_effort: str = "low",
 ) -> List[str]:
     provider_name = (provider or "deepl").strip().lower()
     if provider_name not in {"deepl", "openai", "deepseek", "gemini"}:
@@ -645,6 +679,7 @@ def translate_lines_native(
                 max_retries=max_retries,
                 strict_json_fallback=not fastpath_only_main,
                 request_timeout=request_timeout,
+                openai_reasoning_effort=openai_reasoning_effort,
             )
         if provider_name == "deepseek":
             return deepseek_translate_batch(
@@ -688,6 +723,7 @@ def translate_lines_native(
                 max_retries=max_retries,
                 strict_json_fallback=True,
                 request_timeout=request_timeout,
+                openai_reasoning_effort=openai_reasoning_effort,
             )
         if provider_name == "deepseek":
             return deepseek_translate_batch(
@@ -963,12 +999,18 @@ def main():
     ap.add_argument("--every", type=int, default=10, help="Print progress every N lines")
     ap.add_argument("--chunk", type=int, default=None, help="Number of lines per API request")
     ap.add_argument("--concurrency", type=int, default=None, help="Concurrent batches for openai/deepseek/deepl")
-    ap.add_argument("--max-chars", type=int, default=0, help="Max characters per AI request; 0 disables char batching")
-    ap.add_argument("--max-paragraphs", type=int, default=0, help="Max text lines per AI request; 0 disables paragraph batching")
+    ap.add_argument("--max-chars", type=int, default=None, help="Max characters per AI request; 0 disables char batching")
+    ap.add_argument("--max-paragraphs", type=int, default=None, help="Max text lines per AI request; 0 disables paragraph batching")
     ap.add_argument("--rps", type=float, default=0, help="Max request submissions per second; 0 disables rate limiting")
     ap.add_argument("--max-retries", type=int, default=None, help="Max retries per request")
     ap.add_argument("--debug-progress", action="store_true", help="Print per-batch debug timing")
-    ap.add_argument("--request-timeout", type=float, default=90.0, help="Per-request timeout in seconds")
+    ap.add_argument("--request-timeout", type=float, default=10.0, help="Per-request timeout in seconds")
+    ap.add_argument(
+        "--openai-reasoning-effort",
+        default="low",
+        choices=sorted(OPENAI_REASONING_EFFORT_CHOICES),
+        help="OpenAI reasoning effort (default: low)",
+    )
     ap.add_argument("--no-thinking", action="store_true", help="DeepSeek only: disable thinking mode")
     ap.add_argument("--with-thinking", action="store_true", help="DeepSeek only: enable thinking mode")
     ap.add_argument(
@@ -1015,12 +1057,14 @@ def main():
         resolved_endpoint = normalize_gemini_endpoint(resolved_endpoint, resolved_model)
     resolved_chunk = max(1, int(args.chunk if args.chunk is not None else defaults["chunk"]))
     resolved_concurrency = max(1, int(args.concurrency if args.concurrency is not None else defaults["concurrency"]))
+    resolved_max_chars = max(0, int(args.max_chars if args.max_chars is not None else defaults.get("max_chars", 0)))
+    resolved_max_paragraphs = max(0, int(args.max_paragraphs if args.max_paragraphs is not None else defaults.get("max_paragraphs", 0)))
     resolved_max_retries = max(0, int(args.max_retries if args.max_retries is not None else defaults["max_retries"]))
 
     print(
         f"Translating via provider={args.provider} endpoint={resolved_endpoint} "
         f"target={args.target} chunk={resolved_chunk} concurrency={resolved_concurrency} "
-        f"max_chars={max(0, args.max_chars)} max_paragraphs={max(0, args.max_paragraphs)} "
+        f"max_chars={resolved_max_chars} max_paragraphs={resolved_max_paragraphs} "
         f"rps={max(0, args.rps)} max_retries={resolved_max_retries} ..."
     )
     failed_batches = 0
@@ -1040,8 +1084,8 @@ def main():
         every=max(1, args.every),
         chunk=resolved_chunk,
         concurrency=resolved_concurrency,
-        max_chars=max(0, args.max_chars),
-        max_paragraphs=max(0, args.max_paragraphs),
+        max_chars=resolved_max_chars,
+        max_paragraphs=resolved_max_paragraphs,
         rps=max(0, args.rps),
         max_retries=resolved_max_retries,
         batch_error_callback=on_batch_error,
@@ -1051,6 +1095,7 @@ def main():
         slow_split_threshold=max(0.0, float(args.slow_split_threshold)),
         repair_concurrency=max(1, int(args.repair_concurrency)),
         no_thinking=(False if args.with_thinking else True),
+        openai_reasoning_effort=args.openai_reasoning_effort,
     )
 
     print(f"Writing: {out_path}")

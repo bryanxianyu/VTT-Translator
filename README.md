@@ -18,7 +18,7 @@
 - 实时进度和日志
 - 任务级隔离（`job_id`），状态/下载不会互相覆盖
 - DeepL 默认参数：`chunkSize=160`、`concurrency=2`、`maxRetries=2`、`max_chars=0`、`max_paragraphs=0`
-- OpenAI 默认参数：`chunkSize=5`、`concurrency=12`、`maxRetries=2`、`max_chars=1800`、`max_paragraphs=12`、`model=gpt-5.4-nano`
+- OpenAI 默认参数：`chunkSize=5`、`concurrency=96`、`maxRetries=1`、`max_chars=1200`、`max_paragraphs=6`、`model=gpt-5-nano`
 - DeepSeek 默认参数：`chunkSize=5`、`concurrency=12`、`maxRetries=2`、`max_chars=1800`、`max_paragraphs=12`、`model=deepseek-v4-flash`（默认关闭思考模式）
 - Gemini 默认参数：`chunkSize=5`、`concurrency=12`、`maxRetries=1`、`max_chars=1800`、`max_paragraphs=12`、`model=gemini-2.5-flash-lite`
 - 参数默认值按 `provider` 隔离配置
@@ -60,8 +60,8 @@ VTT_WEB_HOST=127.0.0.1 VTT_WEB_PORT=8080 VTT_WEB_DEBUG=false python vtt_translat
 ## OpenAI 端点说明
 
 - `https://api.openai.com/v1/responses`
-- 默认模型：`gpt-5.4-nano`
-- Web 端当前内置可选：`gpt-5.4-nano` / `gpt-5.4-mini` / `gpt-5.4` / `gpt-4.1-mini` / `gpt-4.1` / `gpt-4o-mini`
+- 默认模型：`gpt-5-nano`
+- Web 端当前内置可选：`gpt-5-nano` / `gpt-5.4-nano` / `gpt-5.4-mini` / `gpt-5.4` / `gpt-4.1-nano` / `gpt-4.1-mini` / `gpt-4.1` / `gpt-4o-mini`
 
 ## DeepSeek 端点说明（OpenAI-compatible）
 
@@ -72,7 +72,7 @@ VTT_WEB_HOST=127.0.0.1 VTT_WEB_PORT=8080 VTT_WEB_DEBUG=false python vtt_translat
 
 - 默认 base URL：`https://generativelanguage.googleapis.com/v1beta`
 - 后端会自动补全到 `.../models/{model}:generateContent`
-- 当前内置可选模型：`gemini-2.5-flash-lite` / `gemini-2.5-flash` / `gemini-3.1-flash-lite-preview`
+- 当前内置可选模型：`gemini-2.5-flash-lite`
 
 ## 注意事项
 

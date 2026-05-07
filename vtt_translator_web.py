@@ -48,9 +48,18 @@ ALLOWED_OPENAI_ENDPOINTS = {OPENAI_RESPONSES_ENDPOINT}
 ALLOWED_DEEPSEEK_ENDPOINT_PREFIX = "https://api.deepseek.com"
 ALLOWED_GEMINI_ENDPOINT_PREFIX = "https://generativelanguage.googleapis.com"
 ALLOWED_TARGET_LANGS = {"ZH", "EN", "JA", "KO", "FR", "DE", "ES", "IT", "PT", "RU"}
-ALLOWED_OPENAI_MODELS = {"gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.4", "gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini"}
+ALLOWED_OPENAI_MODELS = {
+    "gpt-5-nano",
+    "gpt-5.4-nano",
+    "gpt-5.4-mini",
+    "gpt-5.4",
+    "gpt-4.1-nano",
+    "gpt-4.1-mini",
+    "gpt-4.1",
+    "gpt-4o-mini",
+}
 ALLOWED_DEEPSEEK_MODELS = {"deepseek-v4-flash", "deepseek-v4-pro"}
-ALLOWED_GEMINI_MODELS = {"gemini-3.1-flash-lite-preview", "gemini-2.5-flash-lite", "gemini-2.5-flash"}
+ALLOWED_GEMINI_MODELS = {"gemini-2.5-flash-lite"}
 
 TRANSLATOR_PROFILES = {
     "deepl": {
@@ -62,21 +71,21 @@ TRANSLATOR_PROFILES = {
     },
     "openai": {
         "default_chunk_size": 5,
-        "default_concurrency": 12,
-        "default_max_retries": 2,
+        "default_concurrency": 96,
+        "default_max_retries": 1,
         "default_endpoint": OPENAI_RESPONSES_ENDPOINT,
         "default_model": "gpt-5.4-nano",
     },
     "deepseek": {
         "default_chunk_size": 5,
-        "default_concurrency": 12,
-        "default_max_retries": 2,
+        "default_concurrency": 96,
+        "default_max_retries": 1,
         "default_endpoint": DEEPSEEK_CHAT_COMPLETIONS_ENDPOINT,
         "default_model": DEEPSEEK_DEFAULT_MODEL,
     },
     "gemini": {
         "default_chunk_size": 5,
-        "default_concurrency": 12,
+        "default_concurrency": 96,
         "default_max_retries": 1,
         "default_endpoint": GEMINI_BASE_URL,
         "default_model": "gemini-2.5-flash-lite",
@@ -235,6 +244,7 @@ def translate_worker(
     request_timeout,
     fallback_mode,
     repair_concurrency,
+    openai_reasoning_effort,
 ):
     """翻译工作线程"""
     try:
@@ -286,6 +296,7 @@ def translate_worker(
             request_timeout,
             fallback_mode,
             repair_concurrency,
+            openai_reasoning_effort,
         )
 
         if not should_continue(job_id):
@@ -342,6 +353,7 @@ def translate_with_progress(
     request_timeout,
     fallback_mode,
     repair_concurrency,
+    openai_reasoning_effort,
 ):
     """带进度显示的翻译函数，底层复用核心并发逻辑"""
     from translate_vtt_zh_deepl_native import should_translate, translate_lines_native
@@ -383,7 +395,21 @@ def translate_with_progress(
         request_timeout=request_timeout,
         fallback_mode=fallback_mode,
         repair_concurrency=repair_concurrency,
+        openai_reasoning_effort=openai_reasoning_effort,
     )
+
+
+def allowed_openai_reasoning_efforts(model: str) -> set[str]:
+    model_lower = (model or "").strip().lower()
+    # gpt-5.4 family supports none/low/medium/high/xhigh.
+    if model_lower.startswith("gpt-5.4"):
+        return {"none", "low", "medium", "high", "xhigh"}
+    # gpt-5-nano family supports minimal/low/medium/high.
+    if model_lower.startswith("gpt-5"):
+        return {"minimal", "low", "medium", "high"}
+    # non GPT-5 models: reasoning effort is not exposed in this tool.
+    return {"low"}
+
 
 @app.route('/')
 def index():
@@ -552,17 +578,17 @@ def index():
                 <div class="form-group" id="modelGroup">
                     <label for="model">模型:</label>
                     <select id="model" name="model">
+                        <option value="gpt-5-nano">gpt-5-nano</option>
                         <option value="gpt-5.4-nano">gpt-5.4-nano</option>
                         <option value="gpt-5.4-mini">gpt-5.4-mini</option>
                         <option value="gpt-5.4">gpt-5.4</option>
+                        <option value="gpt-4.1-nano">gpt-4.1-nano</option>
                         <option value="gpt-4.1-mini">gpt-4.1-mini</option>
                         <option value="gpt-4.1">gpt-4.1</option>
                         <option value="gpt-4o-mini">gpt-4o-mini</option>
                         <option value="deepseek-v4-flash">deepseek-v4-flash</option>
                         <option value="deepseek-v4-pro">deepseek-v4-pro</option>
                         <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
-                        <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-                        <option value="gemini-3.1-flash-lite-preview">gemini-3.1-flash-lite-preview</option>
                     </select>
                 </div>
                 
@@ -591,13 +617,13 @@ def index():
                 
                 <div class="form-group">
                     <label>chunk(兜底): <input type="number" id="chunkSize" name="chunkSize" value="5" min="1" max="1000" class="number-input"></label>
-                    <label style="margin-left: 20px;">并发数: <input type="number" id="concurrency" name="concurrency" value="12" min="1" max="20" class="number-input"></label>
+                    <label style="margin-left: 20px;">并发数: <input type="number" id="concurrency" name="concurrency" value="80" min="1" max="200" class="number-input"></label>
                     <label style="margin-left: 20px;">最大重试次数: <input type="number" id="maxRetries" name="maxRetries" value="2" min="0" max="10" class="number-input"></label>
                 </div>
 
                 <div class="form-group">
                     <label>自适应分批: max_chars <input type="number" id="maxChars" name="maxChars" value="1800" min="0" max="20000" class="number-input"></label>
-                    <label style="margin-left: 20px;">max_paragraphs <input type="number" id="maxParagraphs" name="maxParagraphs" value="12" min="0" max="200" class="number-input"></label>
+                    <label style="margin-left: 20px;">max_paragraphs <input type="number" id="maxParagraphs" name="maxParagraphs" value="6" min="0" max="200" class="number-input"></label>
                     <label style="margin-left: 20px;">RPS <input type="number" id="rps" name="rps" value="0" min="0" max="100" step="0.1" class="number-input"></label>
                 </div>
                 <div class="form-group">
@@ -605,7 +631,17 @@ def index():
                 </div>
 
                 <div class="form-group">
-                    <label>超时(s) <input type="number" id="requestTimeout" name="requestTimeout" value="90" min="1" max="300" class="number-input"></label>
+                    <label>超时(s) <input type="number" id="requestTimeout" name="requestTimeout" value="10" min="1" max="300" class="number-input"></label>
+                    <label style="margin-left: 20px;" id="openaiReasoningGroup">OpenAI reasoning
+                        <select id="openaiReasoningEffort" name="openaiReasoningEffort" class="number-input" style="width: 140px;">
+                            <option value="low" selected>low</option>
+                            <option value="minimal">minimal</option>
+                            <option value="none">none</option>
+                            <option value="medium">medium</option>
+                            <option value="high">high</option>
+                            <option value="xhigh">xhigh</option>
+                        </select>
+                    </label>
                     <label style="margin-left: 20px;">fallback模式
                         <select id="fallbackMode" name="fallbackMode" class="number-input" style="width: 150px;">
                             <option value="immediate">immediate</option>
@@ -663,13 +699,24 @@ def index():
                     ],
                     endpoint: 'https://api.openai.com/v1/responses',
                     chunkSize: 5,
-                    concurrency: 12,
-                    maxRetries: 2,
-                    maxChars: 1800,
-                    maxParagraphs: 12,
+                    concurrency: 96,
+                    maxRetries: 1,
+                    maxChars: 1200,
+                    maxParagraphs: 6,
                     modelDisabled: false,
                     model: 'gpt-5.4-nano',
-                    models: ['gpt-5.4-nano', 'gpt-5.4-mini', 'gpt-5.4', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o-mini'],
+                    models: ['gpt-5-nano', 'gpt-5.4-nano', 'gpt-5.4-mini', 'gpt-5.4', 'gpt-4.1-nano', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o-mini'],
+                    openaiReasoningEffort: 'low',
+                    reasoningByModel: {
+                        'gpt-5-nano': ['minimal', 'low', 'medium', 'high'],
+                        'gpt-5.4-nano': ['none', 'low', 'medium', 'high', 'xhigh'],
+                        'gpt-5.4-mini': ['none', 'low', 'medium', 'high', 'xhigh'],
+                        'gpt-5.4': ['none', 'low', 'medium', 'high', 'xhigh'],
+                        'gpt-4.1-nano': ['low'],
+                        'gpt-4.1-mini': ['low'],
+                        'gpt-4.1': ['low'],
+                        'gpt-4o-mini': ['low'],
+                    },
                 },
                 deepseek: {
                     apiKeyLabel: 'DeepSeek API密钥:',
@@ -679,13 +726,15 @@ def index():
                     ],
                     endpoint: 'https://api.deepseek.com/chat/completions',
                     chunkSize: 5,
-                    concurrency: 12,
-                    maxRetries: 2,
-                    maxChars: 1800,
-                    maxParagraphs: 12,
+                    concurrency: 96,
+                    maxRetries: 1,
+                    maxChars: 1200,
+                    maxParagraphs: 6,
                     modelDisabled: false,
                     model: 'deepseek-v4-flash',
                     models: ['deepseek-v4-flash', 'deepseek-v4-pro'],
+                    openaiReasoningEffort: 'low',
+                    reasoningByModel: {},
                 },
                 gemini: {
                     apiKeyLabel: 'Gemini API密钥:',
@@ -695,13 +744,15 @@ def index():
                     ],
                     endpoint: 'https://generativelanguage.googleapis.com/v1beta',
                     chunkSize: 5,
-                    concurrency: 12,
+                    concurrency: 96,
                     maxRetries: 1,
-                    maxChars: 1800,
-                    maxParagraphs: 12,
+                    maxChars: 1200,
+                    maxParagraphs: 6,
                     modelDisabled: false,
                     model: 'gemini-2.5-flash-lite',
-                    models: ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-3.1-flash-lite-preview'],
+                    models: ['gemini-2.5-flash-lite'],
+                    openaiReasoningEffort: 'low',
+                    reasoningByModel: {},
                 },
             };
             
@@ -712,13 +763,39 @@ def index():
             document.getElementById('provider').addEventListener('change', function() {
                 applyProviderDefaults(this.value);
             });
+            document.getElementById('model').addEventListener('change', function() {
+                refreshOpenAIReasoningOptions();
+            });
             applyProviderDefaults('openai');
+
+            function refreshOpenAIReasoningOptions() {
+                const provider = document.getElementById('provider').value;
+                const p = providerDefaults[provider] || providerDefaults.deepl;
+                const model = document.getElementById('model').value || '';
+                const sel = document.getElementById('openaiReasoningEffort');
+                if (!sel) return;
+
+                const allowed = (p.reasoningByModel && p.reasoningByModel[model]) || ['low'];
+                const current = sel.value || p.openaiReasoningEffort || 'low';
+                sel.innerHTML = '';
+                allowed.forEach(v => {
+                    const option = document.createElement('option');
+                    option.value = v;
+                    option.textContent = v;
+                    sel.appendChild(option);
+                });
+                const next = allowed.includes(current) ? current : (allowed.includes('low') ? 'low' : allowed[0]);
+                sel.value = next || 'low';
+                sel.disabled = provider !== 'openai' || allowed.length === 1;
+            }
 
             function applyProviderDefaults(provider) {
                 const p = providerDefaults[provider] || providerDefaults.deepl;
                 const endpoint = document.getElementById('endpoint');
                 const model = document.getElementById('model');
                 const modelGroup = document.getElementById('modelGroup');
+                const openaiReasoningGroup = document.getElementById('openaiReasoningGroup');
+                const openaiReasoningEffort = document.getElementById('openaiReasoningEffort');
                 const apiKeyLabel = document.getElementById('apiKeyLabel');
                 const apiKey = document.getElementById('apiKey');
                 endpoint.innerHTML = '';
@@ -748,6 +825,11 @@ def index():
                 model.value = p.model || '';
                 model.disabled = p.modelDisabled;
                 modelGroup.style.display = p.modelDisabled ? 'none' : 'block';
+                if (openaiReasoningGroup && openaiReasoningEffort) {
+                    openaiReasoningGroup.style.display = provider === 'openai' ? 'inline-flex' : 'none';
+                    openaiReasoningEffort.value = p.openaiReasoningEffort || 'low';
+                }
+                refreshOpenAIReasoningOptions();
                 apiKeyLabel.textContent = p.apiKeyLabel;
                 apiKey.placeholder = p.apiKeyPlaceholder || '';
             }
@@ -776,6 +858,7 @@ def index():
                 formData.append('maxParagraphs', document.getElementById('maxParagraphs').value);
                 formData.append('rps', document.getElementById('rps').value);
                 formData.append('requestTimeout', document.getElementById('requestTimeout').value);
+                formData.append('openaiReasoningEffort', document.getElementById('openaiReasoningEffort').value);
                 formData.append('fallbackMode', document.getElementById('fallbackMode').value);
                 formData.append('repairConcurrency', document.getElementById('repairConcurrency').value);
                 
@@ -952,22 +1035,23 @@ def translate():
             concurrency = int(request.form.get('concurrency', profile["default_concurrency"]))
             max_retries = int(request.form.get('maxRetries', profile["default_max_retries"]))
             max_chars = int(request.form.get('maxChars', 0))
-            max_paragraphs = int(request.form.get('maxParagraphs', 0))
+            max_paragraphs = int(request.form.get('maxParagraphs', 6))
             repair_concurrency = int(request.form.get('repairConcurrency', 1))
         except ValueError:
             return jsonify({'success': False, 'error': '参数格式错误：数值参数必须是数字'})
 
         try:
             rps = float(request.form.get('rps', 0))
-            request_timeout = float(request.form.get('requestTimeout', 90))
+            request_timeout = float(request.form.get('requestTimeout', 10))
         except ValueError:
             return jsonify({'success': False, 'error': '参数格式错误：rps/requestTimeout 必须是数字'})
 
         fallback_mode = (request.form.get('fallbackMode') or 'immediate').strip().lower()
+        openai_reasoning_effort = (request.form.get('openaiReasoningEffort') or 'low').strip().lower()
 
         # 后端强制限幅，避免前端限制被绕过导致超大请求
         chunk_size = max(1, min(MAX_CHUNK_SIZE, chunk_size))
-        concurrency = max(1, min(20, concurrency))
+        concurrency = max(1, min(200, concurrency))
         max_retries = max(0, min(10, max_retries))
         max_chars = max(0, min(20000, max_chars))
         max_paragraphs = max(0, min(500, max_paragraphs))
@@ -976,6 +1060,8 @@ def translate():
         repair_concurrency = max(1, min(20, repair_concurrency))
         if fallback_mode not in {"immediate", "deferred", "deferred-fastpath"}:
             return jsonify({'success': False, 'error': '非法 fallbackMode'})
+        if openai_reasoning_effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+            return jsonify({'success': False, 'error': '非法 openaiReasoningEffort'})
 
         if not api_key:
             return jsonify({'success': False, 'error': 'API Key 不能为空'})
@@ -989,6 +1075,9 @@ def translate():
                 return jsonify({'success': False, 'error': '非法 endpoint'})
             if model not in ALLOWED_OPENAI_MODELS:
                 return jsonify({'success': False, 'error': '非法 model'})
+            allowed_efforts = allowed_openai_reasoning_efforts(model)
+            if openai_reasoning_effort not in allowed_efforts:
+                return jsonify({'success': False, 'error': f'模型 {model} 不支持 reasoning={openai_reasoning_effort}'})
         elif provider == "deepseek":
             if not endpoint.startswith(ALLOWED_DEEPSEEK_ENDPOINT_PREFIX):
                 return jsonify({'success': False, 'error': '非法 endpoint'})
@@ -1011,7 +1100,7 @@ def translate():
             target=translate_worker,
             args=(job_id, input_path, output_path, provider, api_key, endpoint, target_lang,
                   model, bilingual, chunk_size, concurrency, max_retries,
-                  max_chars, max_paragraphs, rps, request_timeout, fallback_mode, repair_concurrency),
+                  max_chars, max_paragraphs, rps, request_timeout, fallback_mode, repair_concurrency, openai_reasoning_effort),
             daemon=True
         )
         thread.start()
