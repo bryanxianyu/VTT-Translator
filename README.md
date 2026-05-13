@@ -55,7 +55,7 @@ VTT_WEB_HOST=127.0.0.1 VTT_WEB_PORT=8080 VTT_WEB_DEBUG=false python vtt_translat
 - 免费版：`https://api-free.deepl.com/v2/translate`
 - 专业版：`https://api.deepl.com/v2/translate`
 
-中文目标语言代码请使用 `ZH`。
+中文目标语言代码可使用 `ZH`（简体中文）或 `ZH-HK`（繁体中文）。在 DeepL 下，`ZH-HK` 会自动映射为 `ZH-HANT`。繁体粤语使用 `YUE`，仅支持 OpenAI / DeepSeek / Gemini（DeepL 不支持 `YUE`）。
 
 ## OpenAI 端点说明
 

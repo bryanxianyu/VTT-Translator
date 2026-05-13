@@ -47,7 +47,21 @@ ALLOWED_ENDPOINTS = {
 ALLOWED_OPENAI_ENDPOINTS = {OPENAI_RESPONSES_ENDPOINT}
 ALLOWED_DEEPSEEK_ENDPOINT_PREFIX = "https://api.deepseek.com"
 ALLOWED_GEMINI_ENDPOINT_PREFIX = "https://generativelanguage.googleapis.com"
-ALLOWED_TARGET_LANGS = {"ZH", "EN", "JA", "KO", "FR", "DE", "ES", "IT", "PT", "RU"}
+ALLOWED_TARGET_LANGS = {
+    "ZH",
+    "ZH-HK",
+    "EN",
+    "JA",
+    "KO",
+    "FR",
+    "DE",
+    "ES",
+    "IT",
+    "PT",
+    "RU",
+    "YUE",
+}
+AI_ONLY_TARGET_LANGS = {"YUE"}
 ALLOWED_OPENAI_MODELS = {
     "gpt-5-nano",
     "gpt-5.4-nano",
@@ -596,6 +610,8 @@ def index():
                     <label for="targetLang">目标语言:</label>
                     <select id="targetLang" name="targetLang">
                         <option value="ZH">中文 (ZH)</option>
+                        <option value="ZH-HK">ZH (Traditional)</option>
+                        <option value="YUE">繁体粤语 (YUE)</option>
                         <option value="EN">英语 (EN)</option>
                         <option value="JA">日语 (JA)</option>
                         <option value="KO">韩语 (KO)</option>
@@ -673,6 +689,22 @@ def index():
         <script>
             let isTranslating = false;
             let currentJobId = null;
+            const baseTargetLangs = [
+                { value: 'ZH', label: '中文 (ZH)' },
+                { value: 'ZH-HK', label: 'ZH (Traditional)' },
+                { value: 'EN', label: '英语 (EN)' },
+                { value: 'JA', label: '日语 (JA)' },
+                { value: 'KO', label: '韩语 (KO)' },
+                { value: 'FR', label: '法语 (FR)' },
+                { value: 'DE', label: '德语 (DE)' },
+                { value: 'ES', label: '西班牙语 (ES)' },
+                { value: 'IT', label: '意大利语 (IT)' },
+                { value: 'PT', label: '葡萄牙语 (PT)' },
+                { value: 'RU', label: '俄语 (RU)' },
+            ];
+            const aiTargetLangs = [
+                { value: 'YUE', label: '繁体粤语 (YUE)' },
+            ];
             const providerDefaults = {
                 deepl: {
                     apiKeyLabel: 'DeepL API密钥:',
@@ -768,6 +800,20 @@ def index():
             });
             applyProviderDefaults('openai');
 
+            function refreshTargetLangOptions(provider) {
+                const targetLang = document.getElementById('targetLang');
+                const current = targetLang.value || 'ZH';
+                const options = provider === 'deepl' ? baseTargetLangs : baseTargetLangs.concat(aiTargetLangs);
+                targetLang.innerHTML = '';
+                options.forEach(item => {
+                    const option = document.createElement('option');
+                    option.value = item.value;
+                    option.textContent = item.label;
+                    targetLang.appendChild(option);
+                });
+                targetLang.value = options.some(item => item.value === current) ? current : 'ZH';
+            }
+
             function refreshOpenAIReasoningOptions() {
                 const provider = document.getElementById('provider').value;
                 const p = providerDefaults[provider] || providerDefaults.deepl;
@@ -815,6 +861,7 @@ def index():
                 if (typeof p.maxParagraphs !== 'undefined') {
                     document.getElementById('maxParagraphs').value = p.maxParagraphs;
                 }
+                refreshTargetLangOptions(provider);
                 model.innerHTML = '';
                 (p.models || []).forEach(m => {
                     const option = document.createElement('option');
@@ -1068,6 +1115,8 @@ def translate():
         if target_lang not in ALLOWED_TARGET_LANGS:
             return jsonify({'success': False, 'error': '非法 targetLang'})
         if provider == "deepl":
+            if target_lang in AI_ONLY_TARGET_LANGS:
+                return jsonify({'success': False, 'error': 'DeepL 不支持繁体粤语，请选择 OpenAI / DeepSeek / Gemini'})
             if endpoint not in ALLOWED_ENDPOINTS:
                 return jsonify({'success': False, 'error': '非法 endpoint'})
         elif provider == "openai":
