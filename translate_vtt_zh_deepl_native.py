@@ -8,6 +8,7 @@ Supports providers:
 - openai (Responses API)
 - deepseek (OpenAI-compatible Responses API)
 - gemini (Gemini generateContent API)
+- google-web (experimental, unofficial web endpoint)
 """
 
 import argparse
@@ -16,8 +17,10 @@ import json
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List
+from urllib.parse import quote
 
 import requests
 
@@ -51,6 +54,15 @@ GEMINI_DEFAULT_MAX_PARAGRAPHS = 6
 GEMINI_DEFAULT_MODEL = "gemini-2.5-flash-lite"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
+WEB_TRANSLATOR_DEFAULT_CHUNK_SIZE = 1
+GOOGLE_WEB_DEFAULT_CONCURRENCY = 96
+GOOGLE_WEB_DEFAULT_MAX_CHARS = 1200
+GOOGLE_WEB_DEFAULT_MAX_PARAGRAPHS = 10
+WEB_TRANSLATOR_DEFAULT_MAX_RETRIES = 1
+KEYLESS_PROVIDERS = {"google-web"}
+SPLIT_FALLBACK_PROVIDERS = {"openai", "deepseek", "gemini", "google-web"}
+SUPPORTED_PROVIDERS = {"deepl", "openai", "deepseek", "gemini", "google-web"}
+
 AI_LINE_SEPARATOR = "\n<<<VTT_TRANSLATOR_LINE_BREAK_8F3B>>>\n"
 YUE_TARGET_CODES = {"YUE", "CANTONESE"}
 TRADITIONAL_CHINESE_TARGET_CODES = {"ZH-HK"}
@@ -59,6 +71,61 @@ TIMECODE_RE = re.compile(r"^\s*\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2
 WEBVTT_RE = re.compile(r"^\s*WEBVTT", re.IGNORECASE)
 INDEX_RE = re.compile(r"^\s*\d+\s*$")
 VOICE_TAG_RE = re.compile(r"^(?P<prefix>\s*<v\b[^>]*>)(?P<body>.*?)(?P<suffix>\s*</v>\s*)?$")
+
+
+ERROR_NETWORK = "network_error"
+ERROR_TIMEOUT = "timeout_error"
+ERROR_AUTH = "auth_error"
+ERROR_RATE_LIMIT = "rate_limit_error"
+ERROR_RESPONSE_FORMAT = "response_format_error"
+ERROR_BATCH = "batch_failed"
+
+
+class TranslationError(RuntimeError):
+    def __init__(
+        self,
+        category: str,
+        provider: str,
+        message: str,
+        status_code: int | None = None,
+    ) -> None:
+        self.category = category
+        self.provider = provider
+        self.status_code = status_code
+        super().__init__(message)
+
+
+def _http_error_category(status_code: int) -> str:
+    if status_code in {401, 403}:
+        return ERROR_AUTH
+    if status_code == 429:
+        return ERROR_RATE_LIMIT
+    return ERROR_NETWORK
+
+
+def _raise_http_error(provider: str, status_code: int, body_text: str) -> None:
+    body = (body_text or "").strip().replace("\n", " ")
+    snippet = body[:500] if body else "<empty>"
+    raise TranslationError(
+        category=_http_error_category(status_code),
+        provider=provider,
+        status_code=status_code,
+        message=f"HTTP {status_code}: {snippet}",
+    )
+
+
+def _normalize_exception(provider: str, exc: Exception, default_category: str = ERROR_BATCH) -> TranslationError:
+    if isinstance(exc, TranslationError):
+        return exc
+    if isinstance(exc, requests.Timeout):
+        return TranslationError(ERROR_TIMEOUT, provider, f"Request timeout: {exc}")
+    if isinstance(exc, requests.ConnectionError):
+        return TranslationError(ERROR_NETWORK, provider, f"Network error: {exc}")
+    if isinstance(exc, requests.RequestException):
+        return TranslationError(ERROR_NETWORK, provider, f"Request error: {exc}")
+    if isinstance(exc, json.JSONDecodeError):
+        return TranslationError(ERROR_RESPONSE_FORMAT, provider, f"Invalid JSON response: {exc}")
+    return TranslationError(default_category, provider, str(exc))
 
 
 def is_timecode(line: str) -> bool:
@@ -145,6 +212,16 @@ def build_text_batches(
 
 def provider_defaults(provider: str) -> dict[str, int | str]:
     provider_name = (provider or "deepl").strip().lower()
+    if provider_name == "google-web":
+        return {
+            "chunk": WEB_TRANSLATOR_DEFAULT_CHUNK_SIZE,
+            "concurrency": GOOGLE_WEB_DEFAULT_CONCURRENCY,
+            "max_chars": GOOGLE_WEB_DEFAULT_MAX_CHARS,
+            "max_paragraphs": GOOGLE_WEB_DEFAULT_MAX_PARAGRAPHS,
+            "max_retries": WEB_TRANSLATOR_DEFAULT_MAX_RETRIES,
+            "endpoint": "",
+            "model": "",
+        }
     if provider_name == "openai":
         return {
             "chunk": OPENAI_DEFAULT_CHUNK_SIZE,
@@ -187,7 +264,9 @@ def provider_defaults(provider: str) -> dict[str, int | str]:
 def normalize_openai_compatible_endpoint(endpoint: str, provider: str) -> str:
     ep = (endpoint or "").strip()
     if not ep:
-        return OPENAI_RESPONSES_ENDPOINT if provider == "openai" else DEEPSEEK_CHAT_COMPLETIONS_ENDPOINT
+        if provider == "openai":
+            return OPENAI_RESPONSES_ENDPOINT
+        return DEEPSEEK_CHAT_COMPLETIONS_ENDPOINT
 
     if provider == "deepseek" and ep.startswith("https://api.deepseek.com"):
         if ep.endswith("/chat/completions") or ep.endswith("/v1/chat/completions"):
@@ -210,6 +289,29 @@ def normalize_gemini_endpoint(endpoint: str, model: str) -> str:
     if "/models/" in ep:
         return f"{ep}:generateContent"
     return f"{ep}/models/{model}:generateContent"
+
+
+def normalize_provider_endpoint(provider: str, endpoint: str, model: str) -> str:
+    provider_name = (provider or "").strip().lower()
+    if provider_name in KEYLESS_PROVIDERS:
+        return ""
+
+    defaults = provider_defaults(provider_name)
+    ep = (endpoint or "").strip()
+    if not ep:
+        ep = str(defaults["endpoint"])
+    elif provider_name in {"openai", "deepseek", "gemini"} and ep in {
+        "https://api-free.deepl.com/v2/translate",
+        "https://api.deepl.com/v2/translate",
+    }:
+        ep = str(defaults["endpoint"])
+
+    if provider_name in {"openai", "deepseek"}:
+        return normalize_openai_compatible_endpoint(ep, provider_name)
+    if provider_name == "gemini":
+        normalized_model = model or str(defaults["model"])
+        return normalize_gemini_endpoint(ep, normalized_model)
+    return ep
 
 
 def split_voice_tag(line: str) -> tuple[str, str, str]:
@@ -241,6 +343,69 @@ def _resolve_deepl_target_lang(target_lang: str) -> str:
     return target_lang
 
 
+def _resolve_web_target_lang(target_lang: str, provider: str) -> str:
+    code = (target_lang or "ZH").strip().upper()
+    google_map = {
+        "ZH": "zh-CN",
+        "ZH-HK": "zh-TW",
+        "YUE": "yue",
+        "JA": "ja",
+        "KO": "ko",
+        "EN": "en",
+        "FR": "fr",
+        "DE": "de",
+        "ES": "es",
+        "IT": "it",
+        "PT": "pt",
+        "RU": "ru",
+        "AR": "ar",
+        "HI": "hi",
+    }
+    return google_map.get(code, code.lower())
+
+
+def google_web_translate_batch(
+    texts: List[str],
+    target_lang: str,
+    max_retries: int = WEB_TRANSLATOR_DEFAULT_MAX_RETRIES,
+    base_delay: float = 1.0,
+    request_timeout: float = 30.0,
+) -> List[str]:
+    # Unofficial endpoint used only for local experimental testing. It can break or rate-limit.
+    target = _resolve_web_target_lang(target_lang, "google-web")
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+    })
+    out: list[str] = []
+    for text in texts:
+        url = (
+            "https://translate.googleapis.com/translate_a/single"
+            f"?client=gtx&sl=auto&tl={quote(target)}&dt=t&q={quote(text)}"
+        )
+        attempt = 0
+        while True:
+            try:
+                resp = session.get(url, timeout=request_timeout)
+                if resp.status_code != 200:
+                    _raise_http_error("google-web", resp.status_code, resp.text)
+                data = resp.json()
+                translated = "".join(
+                    part[0] for part in (data[0] or [])
+                    if isinstance(part, list) and part and isinstance(part[0], str)
+                ).strip()
+                out.append(translated or text)
+                break
+            except Exception as exc:
+                normalized_exc = _normalize_exception("google-web", exc)
+                if attempt >= max_retries:
+                    raise normalized_exc from exc
+                attempt += 1
+                time.sleep(base_delay * attempt)
+    return out
+
+
 def deepl_translate_batch(
     texts: List[str],
     endpoint: str,
@@ -270,10 +435,11 @@ def deepl_translate_batch(
             if resp.status_code == 200:
                 j = resp.json()
                 return [item.get("text", "") for item in j.get("translations", [])]
-            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:500]}")
-        except Exception:
+            _raise_http_error("deepl", resp.status_code, resp.text)
+        except Exception as exc:
+            normalized_exc = _normalize_exception("deepl", exc)
             if attempt >= max_retries:
-                raise
+                raise normalized_exc from exc
             attempt += 1
             time.sleep(base_delay * attempt)
 
@@ -301,7 +467,7 @@ def _extract_responses_output_text(resp_json: dict) -> str:
         if joined:
             return joined
 
-    raise RuntimeError("OpenAI-compatible response missing output_text")
+    raise TranslationError(ERROR_RESPONSE_FORMAT, "openai", "Response missing output_text")
 
 
 def _strip_code_fence(raw_text: str) -> str:
@@ -316,7 +482,7 @@ def _parse_indexed_json_text(raw_text: str, expected_len: int) -> dict[int, str]
     text = _strip_code_fence(raw_text)
     parsed = json.loads(text)
     if not isinstance(parsed, list):
-        raise RuntimeError("Model output is not a JSON array")
+        raise TranslationError(ERROR_RESPONSE_FORMAT, "ai", "Response is not a JSON array")
 
     out: dict[int, str] = {}
     for item in parsed:
@@ -374,7 +540,11 @@ def _parse_delimited_output(raw_text: str, expected_len: int) -> List[str]:
         compact_separator = AI_LINE_SEPARATOR.strip()
         parts = [part.strip() for part in text.split(compact_separator)]
     if len(parts) != expected_len:
-        raise RuntimeError(f"AI output length mismatch: expected {expected_len}, got {len(parts)}")
+        raise TranslationError(
+            ERROR_RESPONSE_FORMAT,
+            "ai",
+            f"Output length mismatch: expected {expected_len}, got {len(parts)}",
+        )
     return parts
 
 
@@ -396,10 +566,11 @@ def _openai_call_responses(
             resp = requests.post(endpoint, json=payload, headers=headers, timeout=request_timeout)
             if resp.status_code == 200:
                 return _extract_responses_output_text(resp.json())
-            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:500]}")
-        except Exception:
+            _raise_http_error("openai", resp.status_code, resp.text)
+        except Exception as exc:
+            normalized_exc = _normalize_exception("openai", exc)
             if attempt >= max_retries:
-                raise
+                raise normalized_exc from exc
             attempt += 1
             time.sleep(base_delay * attempt)
 
@@ -444,11 +615,16 @@ def _openai_call_chat_completions(
                     content = message.get("content")
                     if isinstance(content, str) and content.strip():
                         return content
-                raise RuntimeError("DeepSeek chat response missing choices[0].message.content")
-            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:500]}")
-        except Exception:
+                raise TranslationError(
+                    ERROR_RESPONSE_FORMAT,
+                    "chat-completions",
+                    "Chat response missing choices[0].message.content",
+                )
+            _raise_http_error("chat-completions", resp.status_code, resp.text)
+        except Exception as exc:
+            normalized_exc = _normalize_exception("chat-completions", exc)
             if attempt >= max_retries:
-                raise
+                raise normalized_exc from exc
             attempt += 1
             time.sleep(base_delay * attempt)
 
@@ -477,11 +653,16 @@ def _gemini_call_generate_content(
                     text = "".join(part.get("text", "") for part in parts if isinstance(part, dict)).strip()
                     if text:
                         return text
-                raise RuntimeError("Gemini response missing candidates[0].content.parts text")
-            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:500]}")
-        except Exception:
+                raise TranslationError(
+                    ERROR_RESPONSE_FORMAT,
+                    "gemini",
+                    "Response missing expected text fields",
+                )
+            _raise_http_error("gemini", resp.status_code, resp.text)
+        except Exception as exc:
+            normalized_exc = _normalize_exception("gemini", exc)
             if attempt >= max_retries:
-                raise
+                raise normalized_exc from exc
             attempt += 1
             time.sleep(base_delay * attempt)
 
@@ -536,21 +717,26 @@ def openai_translate_batch(
         raw = call(system_text, user_text)
         parsed = _parse_indexed_json_text(raw, expected_len=len(texts))
         if len(parsed) != len(texts):
-            raise RuntimeError(f"AI output length mismatch: expected {len(texts)}, got {len(parsed)}")
+            raise TranslationError(
+                ERROR_RESPONSE_FORMAT,
+                "openai",
+                f"Output length mismatch: expected {len(texts)}, got {len(parsed)}",
+            )
         return [parsed[i].strip() for i in range(len(texts))]
 
 
-def deepseek_translate_batch(
+def chat_completions_translate_batch(
     texts: List[str],
     api_key: str,
     target_lang: str,
-    model: str = DEEPSEEK_DEFAULT_MODEL,
-    endpoint: str = DEEPSEEK_CHAT_COMPLETIONS_ENDPOINT,
+    model: str,
+    endpoint: str,
     max_retries: int = DEEPSEEK_DEFAULT_MAX_RETRIES,
     base_delay: float = 1.0,
     strict_json_fallback: bool = True,
     request_timeout: float = 90.0,
-    no_thinking: bool = True,
+    extra_body: dict | None = None,
+    provider_label: str = "chat-completions",
 ) -> List[str]:
     def call(system_text: str, user_text: str) -> str:
         payload = {
@@ -561,8 +747,8 @@ def deepseek_translate_batch(
             ],
             "temperature": 0,
         }
-        if no_thinking:
-            payload["thinking"] = {"type": "disabled"}
+        if extra_body:
+            payload.update(extra_body)
         return _openai_call_chat_completions(
             payload=payload,
             api_key=api_key,
@@ -579,13 +765,44 @@ def deepseek_translate_batch(
     except Exception:
         if not strict_json_fallback:
             raise
-        print(f"[fallback] deepseek batch size={len(texts)} -> indexed-json retry", file=sys.stderr)
+        print(f"[fallback] {provider_label} batch size={len(texts)} -> indexed-json retry", file=sys.stderr)
         system_text, user_text = _build_indexed_json_prompt(texts, target_lang)
         raw = call(system_text, user_text)
         parsed = _parse_indexed_json_text(raw, expected_len=len(texts))
         if len(parsed) != len(texts):
-            raise RuntimeError(f"AI output length mismatch: expected {len(texts)}, got {len(parsed)}")
+            raise TranslationError(
+                ERROR_RESPONSE_FORMAT,
+                provider_label,
+                f"Output length mismatch: expected {len(texts)}, got {len(parsed)}",
+            )
         return [parsed[i].strip() for i in range(len(texts))]
+
+
+def deepseek_translate_batch(
+    texts: List[str],
+    api_key: str,
+    target_lang: str,
+    model: str = DEEPSEEK_DEFAULT_MODEL,
+    endpoint: str = DEEPSEEK_CHAT_COMPLETIONS_ENDPOINT,
+    max_retries: int = DEEPSEEK_DEFAULT_MAX_RETRIES,
+    base_delay: float = 1.0,
+    strict_json_fallback: bool = True,
+    request_timeout: float = 90.0,
+    no_thinking: bool = True,
+) -> List[str]:
+    return chat_completions_translate_batch(
+        texts=texts,
+        api_key=api_key,
+        target_lang=target_lang,
+        model=model,
+        endpoint=endpoint,
+        max_retries=max_retries,
+        base_delay=base_delay,
+        strict_json_fallback=strict_json_fallback,
+        request_timeout=request_timeout,
+        extra_body={"thinking": {"type": "disabled"}} if no_thinking else {"thinking": {"type": "enabled"}},
+        provider_label="deepseek",
+    )
 
 
 def gemini_translate_batch(
@@ -626,8 +843,99 @@ def gemini_translate_batch(
         raw = call(system_text, user_text)
         parsed = _parse_indexed_json_text(raw, expected_len=len(texts))
         if len(parsed) != len(texts):
-            raise RuntimeError(f"AI output length mismatch: expected {len(texts)}, got {len(parsed)}")
+            raise TranslationError(
+                ERROR_RESPONSE_FORMAT,
+                "gemini",
+                f"Output length mismatch: expected {len(texts)}, got {len(parsed)}",
+            )
         return [parsed[i].strip() for i in range(len(texts))]
+
+
+@dataclass
+class ProviderRuntime:
+    provider: str
+    api_key: str
+    endpoint: str
+    target_lang: str
+    model: str
+    max_retries: int
+    request_timeout: float
+    no_thinking: bool
+    openai_reasoning_effort: str
+    deepl_formality: str
+
+
+def _provider_translate_deepl(batch_texts: list[str], runtime: ProviderRuntime, strict_json_fallback: bool) -> list[str]:
+    _ = strict_json_fallback
+    return deepl_translate_batch(
+        batch_texts,
+        endpoint=runtime.endpoint,
+        api_key=runtime.api_key,
+        target_lang=runtime.target_lang,
+        max_retries=runtime.max_retries,
+        request_timeout=runtime.request_timeout,
+        formality=runtime.deepl_formality or None,
+    )
+
+
+def _provider_translate_openai(batch_texts: list[str], runtime: ProviderRuntime, strict_json_fallback: bool) -> list[str]:
+    return openai_translate_batch(
+        batch_texts,
+        api_key=runtime.api_key,
+        target_lang=runtime.target_lang,
+        model=runtime.model,
+        endpoint=runtime.endpoint,
+        max_retries=runtime.max_retries,
+        strict_json_fallback=strict_json_fallback,
+        request_timeout=runtime.request_timeout,
+        openai_reasoning_effort=runtime.openai_reasoning_effort,
+    )
+
+
+def _provider_translate_deepseek(batch_texts: list[str], runtime: ProviderRuntime, strict_json_fallback: bool) -> list[str]:
+    return deepseek_translate_batch(
+        batch_texts,
+        api_key=runtime.api_key,
+        target_lang=runtime.target_lang,
+        model=runtime.model,
+        endpoint=runtime.endpoint,
+        max_retries=runtime.max_retries,
+        strict_json_fallback=strict_json_fallback,
+        request_timeout=runtime.request_timeout,
+        no_thinking=runtime.no_thinking,
+    )
+
+
+def _provider_translate_gemini(batch_texts: list[str], runtime: ProviderRuntime, strict_json_fallback: bool) -> list[str]:
+    return gemini_translate_batch(
+        batch_texts,
+        api_key=runtime.api_key,
+        target_lang=runtime.target_lang,
+        model=runtime.model,
+        endpoint=runtime.endpoint,
+        max_retries=runtime.max_retries,
+        strict_json_fallback=strict_json_fallback,
+        request_timeout=runtime.request_timeout,
+    )
+
+
+def _provider_translate_google_web(batch_texts: list[str], runtime: ProviderRuntime, strict_json_fallback: bool) -> list[str]:
+    _ = strict_json_fallback
+    return google_web_translate_batch(
+        batch_texts,
+        target_lang=runtime.target_lang,
+        max_retries=runtime.max_retries,
+        request_timeout=runtime.request_timeout,
+    )
+
+
+PROVIDER_REGISTRY: dict[str, Callable[[list[str], ProviderRuntime, bool], list[str]]] = {
+    "deepl": _provider_translate_deepl,
+    "openai": _provider_translate_openai,
+    "deepseek": _provider_translate_deepseek,
+    "gemini": _provider_translate_gemini,
+    "google-web": _provider_translate_google_web,
+}
 
 
 def translate_lines_native(
@@ -656,10 +964,30 @@ def translate_lines_native(
     repair_concurrency: int = 1,
     no_thinking: bool = True,
     openai_reasoning_effort: str = "low",
+    deepl_formality: str = "",
 ) -> List[str]:
     provider_name = (provider or "deepl").strip().lower()
-    if provider_name not in {"deepl", "openai", "deepseek", "gemini"}:
+    if provider_name not in SUPPORTED_PROVIDERS:
         raise ValueError(f"Unsupported provider: {provider_name}")
+    translate_fn = PROVIDER_REGISTRY.get(provider_name)
+    if not translate_fn:
+        raise ValueError(f"No provider adapter registered: {provider_name}")
+    defaults = provider_defaults(provider_name)
+    resolved_model = model or str(defaults["model"])
+    resolved_endpoint = normalize_provider_endpoint(provider_name, endpoint, resolved_model)
+
+    runtime = ProviderRuntime(
+        provider=provider_name,
+        api_key=api_key,
+        endpoint=resolved_endpoint,
+        target_lang=target_lang,
+        model=resolved_model,
+        max_retries=max_retries,
+        request_timeout=request_timeout,
+        no_thinking=no_thinking,
+        openai_reasoning_effort=openai_reasoning_effort,
+        deepl_formality=deepl_formality,
+    )
 
     translatable_idx = [i for i, ln in enumerate(lines) if should_translate(ln)]
     line_parts = {i: split_voice_tag(lines[i]) for i in translatable_idx}
@@ -687,93 +1015,10 @@ def translate_lines_native(
         print(f"[debug] {msg}", flush=True)
 
     def translate_batch_with_provider(batch_texts: list[str]) -> list[str]:
-        if provider_name == "deepl":
-            return deepl_translate_batch(
-                batch_texts,
-                endpoint=endpoint,
-                api_key=api_key,
-                target_lang=target_lang,
-                max_retries=max_retries,
-                request_timeout=request_timeout,
-            )
-        if provider_name == "openai":
-            return openai_translate_batch(
-                batch_texts,
-                api_key=api_key,
-                target_lang=target_lang,
-                model=model,
-                endpoint=normalize_openai_compatible_endpoint(endpoint, provider_name),
-                max_retries=max_retries,
-                strict_json_fallback=not fastpath_only_main,
-                request_timeout=request_timeout,
-                openai_reasoning_effort=openai_reasoning_effort,
-            )
-        if provider_name == "deepseek":
-            return deepseek_translate_batch(
-                batch_texts,
-                api_key=api_key,
-                target_lang=target_lang,
-                model=model,
-                endpoint=normalize_openai_compatible_endpoint(endpoint, provider_name),
-                max_retries=max_retries,
-                strict_json_fallback=not fastpath_only_main,
-                request_timeout=request_timeout,
-                no_thinking=no_thinking,
-            )
-        return gemini_translate_batch(
-            batch_texts,
-            api_key=api_key,
-            target_lang=target_lang,
-            model=model,
-            endpoint=endpoint,
-            max_retries=max_retries,
-            strict_json_fallback=not fastpath_only_main,
-            request_timeout=request_timeout,
-        )
+        return translate_fn(batch_texts, runtime, not fastpath_only_main)
 
     def translate_batch_with_provider_strict(batch_texts: list[str]) -> list[str]:
-        if provider_name == "deepl":
-            return deepl_translate_batch(
-                batch_texts,
-                endpoint=endpoint,
-                api_key=api_key,
-                target_lang=target_lang,
-                max_retries=max_retries,
-            )
-        if provider_name == "openai":
-            return openai_translate_batch(
-                batch_texts,
-                api_key=api_key,
-                target_lang=target_lang,
-                model=model,
-                endpoint=normalize_openai_compatible_endpoint(endpoint, provider_name),
-                max_retries=max_retries,
-                strict_json_fallback=True,
-                request_timeout=request_timeout,
-                openai_reasoning_effort=openai_reasoning_effort,
-            )
-        if provider_name == "deepseek":
-            return deepseek_translate_batch(
-                batch_texts,
-                api_key=api_key,
-                target_lang=target_lang,
-                model=model,
-                endpoint=normalize_openai_compatible_endpoint(endpoint, provider_name),
-                max_retries=max_retries,
-                strict_json_fallback=True,
-                request_timeout=request_timeout,
-                no_thinking=no_thinking,
-            )
-        return gemini_translate_batch(
-            batch_texts,
-            api_key=api_key,
-            target_lang=target_lang,
-            model=model,
-            endpoint=endpoint,
-            max_retries=max_retries,
-            strict_json_fallback=True,
-            request_timeout=request_timeout,
-        )
+        return translate_fn(batch_texts, runtime, True)
 
     def translate_batch_recursive(batch_texts: list[str]) -> tuple[list[str], bool, str | None]:
         try:
@@ -781,18 +1026,24 @@ def translate_lines_native(
             translated = translate_batch_with_provider(batch_texts)
             elapsed = time.perf_counter() - t0
             if (
-                provider_name in {"openai", "deepseek", "gemini"}
+                provider_name in SPLIT_FALLBACK_PROVIDERS
                 and slow_split_threshold > 0
                 and len(batch_texts) > 1
                 and elapsed > slow_split_threshold
             ):
-                raise RuntimeError(
+                raise TranslationError(
+                    ERROR_BATCH,
+                    provider_name,
                     f"slow batch {elapsed:.3f}s>{slow_split_threshold:.3f}s, split retry"
                 )
             return translated, False, None
         except Exception as e:
+            normalized_err = _normalize_exception(provider_name, e)
+            if normalized_err.category == ERROR_AUTH:
+                raise normalized_err
             # For AI providers, split-fallback improves strict-mode completion rate.
-            if provider_name in {"openai", "deepseek", "gemini"} and len(batch_texts) > 1:
+            can_split_fallback = provider_name in SPLIT_FALLBACK_PROVIDERS
+            if can_split_fallback and len(batch_texts) > 1:
                 mid = len(batch_texts) // 2
                 left, left_failed, left_err = translate_batch_recursive(batch_texts[:mid])
                 right, right_failed, right_err = translate_batch_recursive(batch_texts[mid:])
@@ -800,9 +1051,9 @@ def translate_lines_native(
                 if left and right and len(left) + len(right) == len(batch_texts):
                     recovered_with_fallback = left_failed or right_failed
                     return left + right, recovered_with_fallback, combined_err
-            if provider_name in {"openai", "deepseek", "gemini"} and len(batch_texts) == 1:
+            if can_split_fallback and len(batch_texts) == 1:
                 # Keep progress by isolating hard failures to a single line.
-                return [batch_texts[0]], True, str(e)
+                return [batch_texts[0]], True, f"[{normalized_err.category}] {normalized_err}"
             raise
 
     def translate_batch(
@@ -820,11 +1071,14 @@ def translate_lines_native(
                 )
                 return bstart, bend, batch_ids, translated, False, None, False
             except Exception as e:
+                normalized_err = _normalize_exception(provider_name, e)
+                if normalized_err.category == ERROR_AUTH:
+                    raise normalized_err
                 dbg(
                     f"batch defer {bstart+1}-{bend} size={len(batch_ids)} "
-                    f"elapsed={time.perf_counter()-t0:.3f}s err={str(e)[:120]}"
+                    f"elapsed={time.perf_counter()-t0:.3f}s err={str(normalized_err)[:120]}"
                 )
-                return bstart, bend, batch_ids, batch_texts, False, str(e), True
+                return bstart, bend, batch_ids, batch_texts, False, f"[{normalized_err.category}] {normalized_err}", True
         try:
             translated, had_fallback, warn_text = translate_batch_recursive(batch_texts)
             dbg(
@@ -833,11 +1087,12 @@ def translate_lines_native(
             )
             return bstart, bend, batch_ids, translated, had_fallback, warn_text, False
         except Exception as e:
+            normalized_err = _normalize_exception(provider_name, e)
             dbg(
                 f"batch fail {bstart+1}-{bend} size={len(batch_ids)} "
-                f"elapsed={time.perf_counter()-t0:.3f}s err={str(e)[:120]}"
+                f"elapsed={time.perf_counter()-t0:.3f}s err={str(normalized_err)[:120]}"
             )
-            return bstart, bend, batch_ids, batch_texts, True, str(e), False
+            return bstart, bend, batch_ids, batch_texts, True, f"[{normalized_err.category}] {normalized_err}", False
 
     def apply_batch_result(
         bstart: int,
@@ -1005,27 +1260,27 @@ def translate_lines_native(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Translate VTT using DeepL/OpenAI/DeepSeek API.")
+    ap = argparse.ArgumentParser(description="Translate VTT using DeepL/OpenAI/DeepSeek/Gemini or experimental web providers.")
     ap.add_argument("input", help="Path to input .vtt")
     ap.add_argument("--out", required=True, help="Path to output .vtt")
-    ap.add_argument("--key", required=True, help="API key for selected provider")
+    ap.add_argument("--key", default="", help="API key for selected provider; optional for experimental web providers")
     ap.add_argument(
         "--provider",
         default="deepl",
-        choices=["deepl", "openai", "deepseek", "gemini"],
+        choices=["deepl", "openai", "deepseek", "gemini", "google-web"],
         help="Translation provider",
     )
     ap.add_argument(
         "--endpoint",
         default="https://api-free.deepl.com/v2/translate",
-        help="Provider endpoint (DeepL Free/Pro or OpenAI-compatible Responses endpoint)",
+        help="Provider endpoint (DeepL Free/Pro, OpenAI Responses, or Chat Completions endpoint)",
     )
-    ap.add_argument("--model", default="", help="Model name for openai/deepseek")
+    ap.add_argument("--model", default="", help="Model name for openai/deepseek/gemini")
     ap.add_argument("--target", default="ZH", help="Target language code (e.g. ZH / ZH-HK / YUE / EN / JA)")
     ap.add_argument("--bilingual", action="store_true", help="Keep original + translated line")
     ap.add_argument("--every", type=int, default=10, help="Print progress every N lines")
     ap.add_argument("--chunk", type=int, default=None, help="Number of lines per API request")
-    ap.add_argument("--concurrency", type=int, default=None, help="Concurrent batches for openai/deepseek/deepl")
+    ap.add_argument("--concurrency", type=int, default=None, help="Concurrent batches for AI/API providers")
     ap.add_argument("--max-chars", type=int, default=None, help="Max characters per AI request; 0 disables char batching")
     ap.add_argument("--max-paragraphs", type=int, default=None, help="Max text lines per AI request; 0 disables paragraph batching")
     ap.add_argument("--rps", type=float, default=0, help="Max request submissions per second; 0 disables rate limiting")
@@ -1040,6 +1295,12 @@ def main():
     )
     ap.add_argument("--no-thinking", action="store_true", help="DeepSeek only: disable thinking mode")
     ap.add_argument("--with-thinking", action="store_true", help="DeepSeek only: enable thinking mode")
+    ap.add_argument(
+        "--deepl-formality",
+        default="",
+        choices=["", "more", "less", "prefer_more", "prefer_less"],
+        help="DeepL only: formality preference",
+    )
     ap.add_argument(
         "--slow-split-threshold",
         type=float,
@@ -1071,20 +1332,18 @@ def main():
     if args.provider == "deepl" and args.target.strip().upper() in YUE_TARGET_CODES:
         print("ERROR: DeepL does not support Traditional Cantonese (YUE). Use an AI provider.", file=sys.stderr)
         sys.exit(1)
+    if args.provider not in KEYLESS_PROVIDERS and not (args.key or "").strip():
+        print(f"ERROR: --key is required for provider={args.provider}", file=sys.stderr)
+        sys.exit(1)
+    if args.provider in KEYLESS_PROVIDERS:
+        print(
+            f"WARNING: provider={args.provider} uses an unofficial web endpoint for local stability testing only.",
+            file=sys.stderr,
+        )
 
     defaults = provider_defaults(args.provider)
-    resolved_endpoint = args.endpoint
-    if args.provider in {"openai", "deepseek", "gemini"} and resolved_endpoint in {
-        "https://api-free.deepl.com/v2/translate",
-        "https://api.deepl.com/v2/translate",
-    }:
-        resolved_endpoint = str(defaults["endpoint"])
-    if args.provider in {"openai", "deepseek"}:
-        resolved_endpoint = normalize_openai_compatible_endpoint(resolved_endpoint, args.provider)
-
     resolved_model = args.model or str(defaults["model"])
-    if args.provider == "gemini":
-        resolved_endpoint = normalize_gemini_endpoint(resolved_endpoint, resolved_model)
+    resolved_endpoint = normalize_provider_endpoint(args.provider, args.endpoint, resolved_model)
     resolved_chunk = max(1, int(args.chunk if args.chunk is not None else defaults["chunk"]))
     resolved_concurrency = max(1, int(args.concurrency if args.concurrency is not None else defaults["concurrency"]))
     resolved_max_chars = max(0, int(args.max_chars if args.max_chars is not None else defaults.get("max_chars", 0)))
@@ -1126,6 +1385,7 @@ def main():
         repair_concurrency=max(1, int(args.repair_concurrency)),
         no_thinking=(False if args.with_thinking else True),
         openai_reasoning_effort=args.openai_reasoning_effort,
+        deepl_formality=args.deepl_formality,
     )
 
     print(f"Writing: {out_path}")

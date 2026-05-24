@@ -25,6 +25,7 @@ from translate_vtt_zh_deepl_native import (
     GEMINI_DEFAULT_MODEL,
     OPENAI_DEFAULT_MODEL,
     OPENAI_RESPONSES_ENDPOINT,
+    TranslationError,
     normalize_gemini_endpoint,
     normalize_openai_compatible_endpoint,
     read_text,
@@ -47,6 +48,9 @@ ALLOWED_ENDPOINTS = {
 ALLOWED_OPENAI_ENDPOINTS = {OPENAI_RESPONSES_ENDPOINT}
 ALLOWED_DEEPSEEK_ENDPOINT_PREFIX = "https://api.deepseek.com"
 ALLOWED_GEMINI_ENDPOINT_PREFIX = "https://generativelanguage.googleapis.com"
+ALLOWED_GOOGLE_WEB_ENDPOINTS = {
+    "https://translate.googleapis.com/translate_a/single",
+}
 ALLOWED_TARGET_LANGS = {
     "ZH",
     "ZH-HK",
@@ -103,6 +107,13 @@ TRANSLATOR_PROFILES = {
         "default_max_retries": 1,
         "default_endpoint": GEMINI_BASE_URL,
         "default_model": "gemini-2.5-flash-lite",
+    },
+    "google-web": {
+        "default_chunk_size": 1,
+        "default_concurrency": 96,
+        "default_max_retries": 1,
+        "default_endpoint": "https://translate.googleapis.com/translate_a/single",
+        "default_model": "",
     }
 }
 
@@ -131,6 +142,8 @@ def create_job(job_id: str, input_file: str, output_file: str, original_filename
             'status': '就绪',
             'log_messages': [],
             'error': None,
+            'error_code': None,
+            'status_code': None,
             'input_file': input_file,
             'output_file': output_file,
             'original_filename': original_filename,
@@ -169,6 +182,8 @@ def get_job_snapshot(job_id: str):
             'status': job['status'],
             'log_messages': list(job['log_messages']),
             'error': job['error'],
+            'error_code': job.get('error_code'),
+            'status_code': job.get('status_code'),
             'stop_requested': job['stop_requested'],
             'created_at': job['created_at'],
             'updated_at': job['updated_at'],
@@ -267,6 +282,8 @@ def translate_worker(
             is_running=True,
             stop_requested=False,
             error=None,
+            error_code=None,
+            status_code=None,
             progress=0,
             current=0,
             total=0,
@@ -341,8 +358,22 @@ def translate_worker(
             update_job(job_id, status="翻译完成", progress=100, current=translatable_count)
 
     except Exception as e:
-        log_message(job_id, f"翻译失败: {str(e)}", "ERROR")
-        update_job(job_id, error=str(e), status="翻译失败")
+        if isinstance(e, TranslationError):
+            err_text = str(e)
+            err_code = e.category
+            status_code = e.status_code
+        else:
+            err_text = str(e)
+            err_code = "internal_error"
+            status_code = None
+        log_message(job_id, f"翻译失败[{err_code}]: {err_text}", "ERROR")
+        update_job(
+            job_id,
+            error=err_text,
+            error_code=err_code,
+            status_code=status_code,
+            status="翻译失败",
+        )
     finally:
         safe_unlink(input_file)
         update_job(job_id, input_file=None)
@@ -573,6 +604,7 @@ def index():
                         <option value="deepl">DeepL</option>
                         <option value="deepseek">DeepSeek</option>
                         <option value="gemini">Gemini</option>
+                        <option value="google-web">Google Web</option>
                     </select>
                 </div>
 
@@ -786,6 +818,26 @@ def index():
                     openaiReasoningEffort: 'low',
                     reasoningByModel: {},
                 },
+                'google-web': {
+                    apiKeyLabel: 'Google Web API密钥:',
+                    apiKeyPlaceholder: 'Google Web 模式无需 API 密钥，可留空',
+                    endpointRequired: false,
+                    endpoints: [
+                        { value: 'https://translate.googleapis.com/translate_a/single', label: 'Google Translate Web (translate.googleapis.com)' }
+                    ],
+                    endpoint: 'https://translate.googleapis.com/translate_a/single',
+                    chunkSize: 1,
+                    concurrency: 96,
+                    maxRetries: 1,
+                    maxChars: 1200,
+                    maxParagraphs: 10,
+                    modelDisabled: true,
+                    model: '',
+                    models: [],
+                    apiKeyRequired: false,
+                    openaiReasoningEffort: 'low',
+                    reasoningByModel: {},
+                },
             };
             
             document.getElementById('translateForm').addEventListener('submit', function(e) {
@@ -879,6 +931,7 @@ def index():
                 refreshOpenAIReasoningOptions();
                 apiKeyLabel.textContent = p.apiKeyLabel;
                 apiKey.placeholder = p.apiKeyPlaceholder || '';
+                apiKey.required = p.apiKeyRequired !== false;
             }
             
             function startTranslation() {
@@ -979,7 +1032,11 @@ def index():
                         setTimeout(pollStatus, 1000);
                     } else {
                         if (data.error) {
-                            addLog('翻译失败: ' + data.error, 'error');
+                            const errorTags = [];
+                            if (data.error_code) errorTags.push(`[${data.error_code}]`);
+                            if (data.status_code) errorTags.push(`HTTP ${data.status_code}`);
+                            const errorPrefix = errorTags.length ? `${errorTags.join(' ')} ` : '';
+                            addLog('翻译失败: ' + errorPrefix + data.error, 'error');
                         } else {
                             addLog('翻译完成！', 'success');
                             addDownloadLink(currentJobId);
@@ -1066,8 +1123,8 @@ def translate():
         
         # 获取参数
         provider = (request.form.get('provider') or 'openai').strip().lower()
-        if provider not in {"openai", "deepl", "deepseek", "gemini"}:
-            return jsonify({'success': False, 'error': '当前Web端仅开放 OpenAI / DeepL / DeepSeek / Gemini'})
+        if provider not in {"openai", "deepl", "deepseek", "gemini", "google-web"}:
+            return jsonify({'success': False, 'error': '当前Web端仅开放 OpenAI / DeepL / DeepSeek / Gemini / Google Web'})
         profile = get_translator_profile(provider)
         if not profile:
             return jsonify({'success': False, 'error': '不支持的 provider'})
@@ -1110,7 +1167,7 @@ def translate():
         if openai_reasoning_effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
             return jsonify({'success': False, 'error': '非法 openaiReasoningEffort'})
 
-        if not api_key:
+        if provider != "google-web" and not api_key:
             return jsonify({'success': False, 'error': 'API Key 不能为空'})
         if target_lang not in ALLOWED_TARGET_LANGS:
             return jsonify({'success': False, 'error': '非法 targetLang'})
@@ -1139,6 +1196,10 @@ def translate():
             if model not in ALLOWED_GEMINI_MODELS:
                 return jsonify({'success': False, 'error': '非法 model'})
             endpoint = normalize_gemini_endpoint(endpoint, model)
+        elif provider == "google-web":
+            if endpoint not in ALLOWED_GOOGLE_WEB_ENDPOINTS:
+                return jsonify({'success': False, 'error': '非法 endpoint'})
+            model = ""
         else:
             return jsonify({'success': False, 'error': '不支持的 provider'})
 

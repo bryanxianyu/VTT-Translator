@@ -7,6 +7,15 @@
 - `vtt_translator_web.py`：Web 服务入口（上传、翻译、进度、停止、下载）
 - `translate_vtt_zh_deepl_native.py`：底层翻译核心模块（供 Web 调用）
 
+## CLI 脚本路径
+
+- 主脚本：`/Users/bryanxianyu/Desktop/VTT-Translator/translate_vtt_zh_deepl_native.py`
+- 常用运行方式：
+
+```bash
+./venv/bin/python translate_vtt_zh_deepl_native.py input.vtt --out output.vtt --provider openai --key "$OPENAI_API_KEY"
+```
+
 ## 功能特性
 
 - 仅翻译字幕文本，保留 VTT 时间轴和结构
@@ -73,6 +82,33 @@ VTT_WEB_HOST=127.0.0.1 VTT_WEB_PORT=8080 VTT_WEB_DEBUG=false python vtt_translat
 - 默认 base URL：`https://generativelanguage.googleapis.com/v1beta`
 - 后端会自动补全到 `.../models/{model}:generateContent`
 - 当前内置可选模型：`gemini-2.5-flash-lite`
+
+## Provider 参数语义
+
+- `--endpoint`：
+  - 为空时自动使用 provider 默认端点。
+  - `deepseek` 且域名为 `https://api.deepseek.com` 时会自动归一到 `/chat/completions`。
+  - 其他兼容端点保持原样。
+- `--model`：
+  - 对 `openai/deepseek/gemini` 生效；`deepl/google-web` 忽略。
+- `--with-thinking / --no-thinking`：
+  - 仅对 `deepseek` 生效，不会注入到其他 provider 请求体。
+- `--openai-reasoning-effort`：
+  - 仅对 OpenAI 模型生效，会按模型能力自动校验/降级到允许值。
+- `--deepl-formality`：
+  - 仅对 DeepL 生效。
+
+## 批处理参数建议
+
+- 高吞吐 AI provider 常用起点：`concurrency=96`, `max_chars=1200`, `max_paragraphs=6`。
+- 如果出现大量 429/超时：
+  - 先降低 `concurrency`；
+  - 再降低 `max_paragraphs` 或 `max_chars`；
+  - 适当提高 `--request-timeout`（例如 10~20）。
+- 回退策略：
+  - `fallback-mode=immediate`：实时分裂回退；
+  - `fallback-mode=deferred`：先跑主流程，后修复失败批次；
+  - `fallback-mode=deferred-fastpath`：修复阶段优先走严格 JSON。
 
 ## 注意事项
 
